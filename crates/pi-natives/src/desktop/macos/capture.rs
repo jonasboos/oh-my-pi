@@ -1,6 +1,11 @@
 mod screen_capture_kit;
 
-use std::ptr;
+use std::{
+	ffi::c_void,
+	mem,
+	ptr::{self, NonNull},
+	sync::LazyLock,
+};
 
 use image::{Rgba, RgbaImage, imageops::FilterType};
 use objc2_app_kit::NSWorkspace;
@@ -9,12 +14,13 @@ use objc2_core_foundation::{
 	CGRect, CGSize,
 };
 use objc2_core_graphics::{
-	CGRectMakeWithDictionaryRepresentation, CGWindowListCopyWindowInfo, CGWindowListOption,
-	kCGWindowBounds, kCGWindowIsOnscreen, kCGWindowLayer, kCGWindowName, kCGWindowNumber,
-	kCGWindowOwnerName, kCGWindowOwnerPID, kCGWindowSharingState,
+	CGDisplayBounds, CGDisplayCopyDisplayMode, CGDisplayIsMain, CGDisplayMode, CGDisplayModelNumber,
+	CGError, CGGetActiveDisplayList, CGRectMakeWithDictionaryRepresentation,
+	CGWindowListCopyWindowInfo, CGWindowListOption, kCGWindowBounds, kCGWindowIsOnscreen,
+	kCGWindowLayer, kCGWindowName, kCGWindowNumber, kCGWindowOwnerName, kCGWindowOwnerPID,
+	kCGWindowSharingState,
 };
 use screen_capture_kit::{CaptureRequest, CaptureTarget};
-use xcap::Monitor;
 
 use super::{
 	super::{
@@ -39,15 +45,65 @@ pub(super) fn capture_permission() -> bool {
 }
 
 fn require_capture_permission() -> CoreResult<()> {
-	if capture_permission() {
-		Ok(())
-	} else {
-		Err(permission::denied(permission::screen_recording_pane()))
-	}
+	capture_permission().ok_or_else(|| permission::denied(permission::screen_recording_pane()))
 }
 
 pub(super) fn capture_available() -> bool {
 	screen_capture_kit::available()
+}
+
+type CreateDisplayInfoFn = unsafe extern "C" fn(display_id: u32) -> *const CFDictionary;
+
+/// `CoreDisplay_DisplayCreateInfoDictionary`, resolved once per process.
+static CREATE_DISPLAY_INFO: LazyLock<Option<CreateDisplayInfoFn>> = LazyLock::new(|| {
+	let path = c"/System/Library/Frameworks/CoreDisplay.framework/CoreDisplay";
+	// SAFETY: `path` is a static NUL-terminated framework path; the handle is
+	// intentionally process-lived.
+	let handle = unsafe { libc::dlopen(path.as_ptr(), libc::RTLD_LAZY) };
+	if handle.is_null() {
+		return None;
+	}
+	// SAFETY: `handle` is a live dlopen handle and the name is NUL-terminated.
+	let raw = unsafe { libc::dlsym(handle, c"CoreDisplay_DisplayCreateInfoDictionary".as_ptr()) };
+	if raw.is_null() {
+		return None;
+	}
+	// SAFETY: CoreDisplay exports this symbol as
+	// `CFDictionaryRef (*)(CGDirectDisplayID)`, which `CreateDisplayInfoFn`
+	// spells.
+	Some(unsafe { mem::transmute::<*mut c_void, CreateDisplayInfoFn>(raw) })
+});
+
+/// The product name the system records for a display, such as "Color LCD".
+///
+/// `NSScreen.localizedName` could provide a friendly name instead, but the
+/// first `NSScreen` call initializes `AppKit`, and `AppKit` registers an
+/// unbundled process like omp as a regular application, so every session
+/// that listed displays gained a Dock icon until it exited. `CoreDisplay`
+/// reads the same display records without `AppKit`.
+fn display_product_name(display_id: u32) -> Option<String> {
+	let create = (*CREATE_DISPLAY_INFO)?;
+	// SAFETY: `create` has the exported signature and accepts any display ID;
+	// unknown IDs return NULL.
+	let info = NonNull::new(unsafe { create(display_id) }.cast_mut())?;
+	// SAFETY: A `Create` function returns a +1 reference, adopted exactly once.
+	let info = unsafe { CFRetained::from_raw(info) };
+	// SAFETY: The info dictionary is keyed by CFString; values are checked
+	// below.
+	let info = unsafe { CFRetained::cast_unchecked::<CFDictionary<CFString, CFType>>(info) };
+	let names = info
+		.get(&CFString::from_str("DisplayProductName"))?
+		.downcast::<CFDictionary>()
+		.ok()?;
+	// SAFETY: `DisplayProductName` maps locale identifiers to localized names.
+	let names = unsafe { CFRetained::cast_unchecked::<CFDictionary<CFString, CFString>>(names) };
+	// Agents read these names; keep them in one language instead of the
+	// session user's locale.
+	if let Some(name) = names.get(&CFString::from_str("en_US")) {
+		return Some(name.to_string());
+	}
+	let (_, localized) = names.to_vecs();
+	localized.first().map(ToString::to_string)
 }
 
 #[derive(Debug, Clone)]
@@ -67,24 +123,38 @@ impl MacCapture {
 	#[allow(clippy::unused_self, reason = "keeps discovery on the backend capture object")]
 	pub(super) fn displays(&self) -> CoreResult<Vec<DesktopDisplay>> {
 		require_capture_permission()?;
-		let monitors = Monitor::all().map_err(|error| {
-			DesktopError::capture_failed(format!("Quartz monitor enumeration failed: {error}"))
-		})?;
-		let mut displays = Vec::with_capacity(monitors.len());
-		for monitor in monitors {
-			let id = monitor.id().map_err(metadata_error)?.to_string();
-			let x = monitor.x().map_err(metadata_error)?;
-			let y = monitor.y().map_err(metadata_error)?;
-			let width = monitor.width().map_err(metadata_error)?;
-			let height = monitor.height().map_err(metadata_error)?;
-			let scale = f64::from(monitor.scale_factor().map_err(metadata_error)?);
-			// xcap's macOS friendly_name path matches CGDirectDisplayID to
-			// NSScreenNumber, then returns NSScreen.localizedName(). Keep the
-			// model-number name as fallback.
-			let name = monitor
-				.friendly_name()
-				.or_else(|_| monitor.name())
-				.unwrap_or_else(|_| format!("Display {id}"));
+		// Keep the existing 16-display snapshot limit. One call avoids a
+		// count/fill race when monitors are connected or disconnected.
+		let mut active_displays = [0; 16];
+		let mut display_count = 0;
+		// SAFETY: The output array holds `max_displays` display IDs and the
+		// count points to a live u32 for the duration of this synchronous call.
+		let error = unsafe {
+			CGGetActiveDisplayList(
+				active_displays.len() as u32,
+				active_displays.as_mut_ptr(),
+				&mut display_count,
+			)
+		};
+		if error != CGError::Success {
+			return Err(DesktopError::capture_failed(format!(
+				"Quartz monitor enumeration failed: CGGetActiveDisplayList failed: {error:?}"
+			)));
+		}
+		let mut displays = Vec::with_capacity(display_count as usize);
+		for &display_id in &active_displays[..display_count as usize] {
+			let id = display_id.to_string();
+			let bounds = CGDisplayBounds(display_id);
+			let x = bounds.origin.x as i32;
+			let y = bounds.origin.y as i32;
+			let width = bounds.size.width as u32;
+			let height = bounds.size.height as u32;
+			let mode = CGDisplayCopyDisplayMode(display_id);
+			// Preserve the previous f32 scale calculation and nullable mode
+			// handling if a display disappears after enumeration.
+			let scale = f64::from(CGDisplayMode::pixel_width(mode.as_deref()) as f32 / width as f32);
+			let name = display_product_name(display_id)
+				.unwrap_or_else(|| format!("Display #{}", CGDisplayModelNumber(display_id)));
 			displays.push(DesktopDisplay {
 				id,
 				name,
@@ -97,7 +167,7 @@ impl MacCapture {
 				pixel_y: 0,
 				pixel_width: scaled_edge(width, scale),
 				pixel_height: scaled_edge(height, scale),
-				is_primary: monitor.is_primary().map_err(metadata_error)?,
+				is_primary: CGDisplayIsMain(display_id),
 			});
 		}
 		if displays.is_empty() {
@@ -515,10 +585,6 @@ fn window_metadata(dictionary: &WindowDictionary) -> Option<(u32, DesktopWindow)
 			focused: false,
 		}))
 	}
-}
-
-fn metadata_error(error: impl std::fmt::Display) -> DesktopError {
-	DesktopError::capture_failed(format!("failed to read native display metadata: {error}"))
 }
 
 fn scaled_edge(value: u32, scale: f64) -> u32 {

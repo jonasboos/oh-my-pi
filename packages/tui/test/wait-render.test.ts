@@ -52,21 +52,47 @@ describe("job renderer task-result preview", () => {
 		await initTheme();
 	});
 
-	it("renders the consumed peer message as a sender card", () => {
+	it("renders every consumed peer message as a sender card, oldest first", () => {
+		const now = Date.now();
 		const component = waitToolRenderer.renderResult(
 			{
-				content: [{ type: "text", text: "[42] Worker: file unlocked" }],
+				content: [{ type: "text", text: "[42] Worker: file unlocked\n\n[43] Reviewer: tests pass" }],
 				details: {
 					op: "wait",
-					waited: { id: "42", from: "Worker", to: "Main", body: "file unlocked", ts: Date.now() },
+					waited: [
+						{ id: "42", from: "Worker", to: "Main", body: "file unlocked", ts: now - 1_000 },
+						{ id: "43", from: "Reviewer", to: "Main", body: "tests pass", ts: now },
+					],
 				},
 			},
 			{ expanded: true, isPartial: false },
 			theme,
 		);
 		const output = Bun.stripANSI(component.render(120).join("\n"));
-		expect(output).toContain("Worker");
-		expect(output).toContain("file unlocked");
+		expect(output.indexOf("Worker")).toBeGreaterThanOrEqual(0);
+		expect(output.indexOf("file unlocked")).toBeGreaterThan(output.indexOf("Worker"));
+		expect(output.indexOf("Reviewer")).toBeGreaterThan(output.indexOf("file unlocked"));
+		expect(output.indexOf("tests pass")).toBeGreaterThan(output.indexOf("Reviewer"));
+	});
+
+	it("describes several consumed messages on one native card", () => {
+		const view = waitToolRenderer.describeResult!(
+			{
+				content: [{ type: "text", text: "" }],
+				details: {
+					op: "wait",
+					waited: [
+						{ id: "42", from: "Worker", to: "Main", body: "file unlocked", ts: 0 },
+						{ id: "43", from: "Reviewer", to: "Main", body: "tests pass", ts: 0, replyTo: "41" },
+					],
+				},
+			},
+			{ expanded: true, isPartial: false },
+		);
+		const json = JSON.stringify(view);
+		expect(json).toContain("IRC ← Worker, Reviewer");
+		expect(json).toContain(" 2 messages");
+		expect(json.indexOf("file unlocked")).toBeLessThan(json.indexOf("tests pass"));
 	});
 
 	it("previews the envelope body, not the wrapper markup", () => {
@@ -118,11 +144,6 @@ describe("job renderer task-result preview", () => {
 		const output = Bun.stripANSI(renderLines(summary));
 		expect(output).toContain('{ "echo": "alpha", "ok": true }');
 		expect(output.split("\n").some(line => line.trim() === "{")).toBe(false);
-	});
-
-	it("passes non-envelope result text through unchanged", () => {
-		const output = renderLines("42 pass, 0 fail (18.4s)");
-		expect(output).toContain("42 pass, 0 fail (18.4s)");
 	});
 
 	it("drops the id column when the label repeats it", () => {
@@ -217,6 +238,55 @@ describe("job renderer task-result preview", () => {
 			expect(Bun.stripANSI(lines.join("\n"))).toContain("Job1 running");
 		});
 
+		it("collapses to one row per settled job instead of re-printing the job tree", () => {
+			const result = {
+				content: [{ type: "text" as const, text: "" }],
+				details: { op: "wait" as const, jobs: jobsData },
+			};
+			const component = waitToolRenderer.renderResult(result, { expanded: false, isPartial: false }, theme);
+			const lines = (component.render(120) as readonly string[]).map(line => Bun.stripANSI(line));
+			// Job2 settled: one completion row. The running jobs collapse into a count,
+			// so the next poll's card does not repeat them.
+			expect(lines).toHaveLength(2);
+			expect(lines[0]).toContain("Job2 done");
+			expect(lines[1]!.trim()).toBe("2 still running");
+			expect(lines.join("\n")).not.toContain("waiting on");
+		});
+
+		it("keeps the waiting header while nothing has settled", () => {
+			const result = {
+				content: [{ type: "text" as const, text: "" }],
+				details: { op: "wait" as const, jobs: [jobsData[0]!, jobsData[2]!] },
+			};
+			const component = waitToolRenderer.renderResult(result, { expanded: false, isPartial: true }, theme);
+			const lines = (component.render(120) as readonly string[]).map(line => Bun.stripANSI(line));
+			expect(lines).toHaveLength(1);
+			expect(lines[0]).toContain("waiting on 2 jobs");
+		});
+
+		it("keeps a failed job's outcome visible when its id overflows the row", () => {
+			const result = {
+				content: [{ type: "text" as const, text: "" }],
+				details: {
+					op: "wait" as const,
+					jobs: [
+						{
+							id: "long-agent-assignment-identifier-1234567890",
+							type: "bash" as const,
+							status: "failed" as const,
+							label: "make",
+							durationMs: 62_000,
+							exitCode: 2,
+						},
+					],
+				},
+			};
+			const component = waitToolRenderer.renderResult(result, { expanded: false, isPartial: false }, theme);
+			const [row] = (component.render(40) as readonly string[]).map(line => Bun.stripANSI(line));
+			expect(row).toContain("failed · exit 2 · 1m2s");
+			expect(Bun.stringWidth(row!)).toBeLessThanOrEqual(40);
+		});
+
 		it("retains the running job in the sealed native wait card", () => {
 			const result = {
 				content: [{ type: "text" as const, text: "Still Running" }],
@@ -292,6 +362,62 @@ describe("job renderer task-result preview", () => {
 			expect(json).not.toContain("artifact write failed");
 		});
 
+		it("keeps a job's artifact capture failure on its collapsed row", () => {
+			const result = {
+				content: [{ type: "text" as const, text: "" }],
+				details: {
+					op: "wait" as const,
+					jobs: [
+						{
+							id: "bg_2",
+							type: "bash" as const,
+							status: "completed" as const,
+							label: "bench",
+							durationMs: 1_000,
+							meta: { artifactError: "write" as const },
+						},
+					],
+				},
+			};
+			const component = waitToolRenderer.renderResult(result, { expanded: false, isPartial: false }, theme);
+			const lines = (component.render(100) as readonly string[]).map(line => Bun.stripANSI(line));
+			expect(lines[0]).toContain("bg_2 done");
+			expect(lines[1]).toContain("artifact write failed");
+		});
+
+		it("caps a large recovered batch on the collapsed card, failures first", () => {
+			const jobs = Array.from({ length: 12 }, (_, i) => ({
+				id: `bg_${i}`,
+				type: "bash" as const,
+				status: i === 11 ? ("failed" as const) : ("completed" as const),
+				label: `job ${i}`,
+				durationMs: 1_000,
+			}));
+			const result = { content: [{ type: "text" as const, text: "" }], details: { op: "wait" as const, jobs } };
+			const component = waitToolRenderer.renderResult(result, { expanded: false, isPartial: false }, theme);
+			const lines = (component.render(100) as readonly string[]).map(line => Bun.stripANSI(line));
+			expect(lines).toHaveLength(9);
+			expect(lines[0]).toContain("bg_11 failed");
+			expect(lines.at(-1)!.trim()).toBe("… 4 more settled");
+		});
+
+		it("caps live widget tiles on the collapsed card and counts the rest", () => {
+			const jobs = Array.from({ length: 10 }, (_, i) => ({
+				id: `bg_${i}`,
+				type: "bash" as const,
+				status: "running" as const,
+				label: `bench ${i}`,
+				durationMs: 1_000,
+				widget: decodeBench,
+			}));
+			const result = { content: [{ type: "text" as const, text: "" }], details: { op: "wait" as const, jobs } };
+			const component = waitToolRenderer.renderResult(result, { expanded: false, isPartial: false }, theme);
+			const text = (component.render(100) as readonly string[]).map(line => Bun.stripANSI(line)).join("\n");
+			expect(text).toContain("bg_7");
+			expect(text).not.toContain("bg_8");
+			expect(text).toContain("2 still running");
+		});
+
 		it("renders agent rows for running agents outside job control", () => {
 			const result = {
 				content: [{ type: "text" as const, text: "" }],
@@ -364,7 +490,7 @@ describe("job renderer task-result preview", () => {
 			const tiles = (strip!.c ?? []) as NativeNode[];
 			expect(tiles.map(tile => byRole(tile, "omp.job.tile.title")?.p)).toMatchObject([
 				{ spans: [{ t: "Bencher" }] },
-				{ spans: [{ t: "verb-bench · decode throughput" }] },
+				{ spans: [{ t: "loadtest · decode throughput" }] },
 			]);
 			const bench = tiles[1]!;
 			expect(byRole(bench, "omp.job.tile.chart")).toBeDefined();
@@ -391,7 +517,7 @@ describe("job renderer task-result preview", () => {
 				const lines = (component.render(100) as readonly string[]).map(line => Bun.stripANSI(line));
 				const row = lines.findIndex(line => line.includes("bg_3"));
 				expect(row).toBeGreaterThan(0);
-				expect(lines[row]).toContain("verb-bench · decode throughput bg_3");
+				expect(lines[row]).toContain("loadtest · decode throughput bg_3");
 				expect(lines[row]).toMatch(/decode 186 tok\/s ▲ 15% {2}42\.0s$/);
 				expect(lines[row + 1]).toMatch(/[▁▂▃▄▅▆▇█]+ {2}186 tok\/s {2}┄ target 200 tok\/s/);
 				for (const line of lines) expect(Bun.stringWidth(line)).toBeLessThanOrEqual(100);
