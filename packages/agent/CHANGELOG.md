@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed OpenRouter remote compaction failing after an image tool result on non-OpenAI models ([#13486](https://github.com/can1357/oh-my-pi/issues/13486)).
+
 ## [18.17.0] - 2026-11-06
 
 ### Added

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed OpenRouter image tool results failing with HTTP 422/400 on non-OpenAI models: the tool text stays a string and the image follows the tool batch in a user message ([#13486](https://github.com/can1357/oh-my-pi/issues/13486)).
+
 ## [18.17.0] - 2026-11-06
 
 ### Added

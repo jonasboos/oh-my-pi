@@ -25,7 +25,9 @@ import {
 	resolveOpenCodeGoCacheAffinity,
 } from "@oh-my-pi/pi-ai/providers/inference-headers";
 import {
+	appendEncodedResponsesToolOutput,
 	encodeResponsesToolResultOutput,
+	RESPONSES_TOOL_IMAGE_ATTACHMENT_TEXT,
 	getOpenAIPromptCacheKey,
 	hoistInterleavedResponsesToolBatchMessages,
 	parseAzureDeploymentNameMap,
@@ -93,7 +95,7 @@ const REMOTE_COMPACTION_REQUEST_OVERHEAD_TOKENS = 256;
  * billing key; trim re-probes share untouched items by reference.
  */
 const remoteImageTokenCache = new WeakMap<Record<string, unknown>, { billingKey: string; tokens: number }>();
-const TOOL_RESULT_IMAGE_ATTACHMENT_TEXT = "Attached image(s) from tool result:";
+const TOOL_RESULT_IMAGE_ATTACHMENT_TEXT = RESPONSES_TOOL_IMAGE_ATTACHMENT_TEXT;
 
 /**
  * A request as the model reads it: every string value decoded (no quoting or
@@ -790,7 +792,11 @@ export function buildOpenAiNativeHistory(
 
 		if (message.role === "toolResult") {
 			const normalized = normalizeResponsesToolCallId(message.toolCallId);
-			const { output, outputText } = encodeResponsesToolResultOutput(message, model, supportsImageDetailOriginal);
+			const { output, outputText, trailingImageContent } = encodeResponsesToolResultOutput(
+				message,
+				model,
+				supportsImageDetailOriginal,
+			);
 			if (demotedComputerCallIds.has(normalized.callId)) {
 				const resultItem =
 					message.providerMetadata?.type === "computer"
@@ -837,11 +843,15 @@ export function buildOpenAiNativeHistory(
 				continue;
 			}
 
-			input.push({
-				type: customCallIds.has(normalized.callId) ? "custom_tool_call_output" : "function_call_output",
-				call_id: normalized.callId,
-				output,
-			});
+			appendEncodedResponsesToolOutput(
+				input,
+				{
+					type: customCallIds.has(normalized.callId) ? "custom_tool_call_output" : "function_call_output",
+					call_id: normalized.callId,
+					output,
+				},
+				trailingImageContent,
+			);
 		}
 
 		msgIndex++;

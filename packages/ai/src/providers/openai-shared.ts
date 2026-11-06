@@ -2749,21 +2749,49 @@ export function convertResponsesAssistantMessage<TApi extends Api>(
 }
 
 /**
+ * Label on the synthetic user message that carries tool-result images when the
+ * Responses host cannot accept them inside `function_call_output.output`.
+ * Compaction's context trimmer recognizes this exact text.
+ */
+export const RESPONSES_TOOL_IMAGE_ATTACHMENT_TEXT = "Attached image(s) from tool result:";
+
+/**
+ * OpenRouter's `/api/v1/responses` adapter forwards a `function_call_output`
+ * whose `output` is a content array only to native OpenAI upstreams. Every
+ * other upstream accepts a string and drops the item when `output` is an
+ * array, so the translated request ends on the assistant function call and
+ * the upstream rejects it (#13486). Other Responses hosts speak the native
+ * schema and keep the array.
+ */
+function responsesToolOutputAcceptsContentArray<TApi extends Api>(model: Model<TApi>): boolean {
+	const compat = model.compat;
+	if (compat == null || typeof compat !== "object" || !("isOpenRouterHost" in compat)) return true;
+	if (compat.isOpenRouterHost !== true) return true;
+	return model.identity.class === "openai";
+}
+
+/**
  * Responses wire output for a tool result plus its text-only fallback.
  *
- * `output` preserves native image blocks for paired function/custom outputs.
- * `outputText` feeds orphan and unsupported-computer fallback messages, which
- * cannot carry the native output array.
+ * `output` is the `function_call_output` / `custom_tool_call_output` value.
+ * Native OpenAI Responses endpoints, including OpenAI-class models hosted on
+ * OpenRouter, receive an ordered content array. OpenRouter's other upstreams
+ * receive `outputText`, and `trailingImageContent` follows as a user message.
+ * `outputText` also feeds orphan and unsupported-computer fallback notes,
+ * which cannot carry the native output array.
  */
 export interface ResponsesToolResultOutputEncoding {
 	output: string | ResponseInputContent[];
 	outputText: string;
+	trailingImageContent?: ResponseInputContent[];
 }
 
 /**
  * Encodes one canonical tool result for OpenAI Responses replay.
  *
- * Image-capable models receive an ordered native content array; text-only
+ * Image-capable models on a host that accepts native tool-output content
+ * receive an ordered content array. OpenRouter models whose upstream is not
+ * OpenAI keep a string output and return the images separately. Text-only
  * models and callers without images receive the compatible string form.
  */
 export function encodeResponsesToolResultOutput<TApi extends Api>(
@@ -2792,18 +2820,66 @@ export function encodeResponsesToolResultOutput<TApi extends Api>(
 	// data; escape the transport copy so a grep/read result cannot poison the
 	// session (#6913). Covers every downstream branch that consumes `output`.
 	const outputText = escapeControlTokens ? escapeHarmonyControlTokens(rawOutput) : rawOutput;
-	const output: string | ResponseInputContent[] =
-		hasImages && supportsImages
-			? toolResult.content.map((block): ResponseInputContent => {
-					if (block.type === "image") return convertResponsesInputImage(block, supportsImageDetailOriginal);
-					const text = block.text.toWellFormed();
-					return {
-						type: "input_text",
-						text: escapeControlTokens ? escapeHarmonyControlTokens(text) : text,
-					};
-				})
-			: outputText;
-	return { output, outputText };
+	const embedImages = hasImages && supportsImages && responsesToolOutputAcceptsContentArray(model);
+	const output: string | ResponseInputContent[] = embedImages
+		? toolResult.content.map((block): ResponseInputContent => {
+				if (block.type === "image") return convertResponsesInputImage(block, supportsImageDetailOriginal);
+				const text = block.text.toWellFormed();
+				return {
+					type: "input_text",
+					text: escapeControlTokens ? escapeHarmonyControlTokens(text) : text,
+				};
+			})
+		: outputText;
+	if (!hasImages || !supportsImages || embedImages) return { output, outputText };
+	const trailingImageContent: ResponseInputContent[] = [
+		{ type: "input_text", text: RESPONSES_TOOL_IMAGE_ATTACHMENT_TEXT },
+	];
+	for (const block of toolResult.content) {
+		if (block.type === "image") {
+			trailingImageContent.push(convertResponsesInputImage(block, supportsImageDetailOriginal));
+		}
+	}
+	return { output, outputText, trailingImageContent };
+}
+
+/** Synthetic user messages appended for tool-result images in the current batch. */
+const syntheticResponsesToolImageMessages = new WeakSet<object>();
+
+/**
+ * Place a tool output ahead of synthetic image messages already emitted for
+ * this batch, so a parallel run stays `calls → outputs → images`.
+ */
+function insertResponsesToolOutputBeforeImages<T extends object>(messages: T[], output: T): void {
+	let index = messages.length;
+	while (index > 0) {
+		const previous = messages[index - 1];
+		if (previous === undefined || !syntheticResponsesToolImageMessages.has(previous)) break;
+		index -= 1;
+	}
+	messages.splice(index, 0, output);
+}
+
+function pushResponsesToolImageMessage<T extends object>(
+	messages: T[],
+	content: readonly ResponseInputContent[],
+): void {
+	const imageMessage = { type: "message", role: "user", content } as T;
+	syntheticResponsesToolImageMessages.add(imageMessage);
+	messages.push(imageMessage);
+}
+
+/**
+ * Append one encoded tool output. Image messages this helper just created stay
+ * after the outputs of that batch.
+ */
+export function appendEncodedResponsesToolOutput<T extends object>(
+	messages: T[],
+	output: T,
+	trailingImageContent: readonly ResponseInputContent[] | undefined,
+): void {
+	insertResponsesToolOutputBeforeImages(messages, output);
+	if (trailingImageContent) pushResponsesToolImageMessage(messages, trailingImageContent);
 }
 
 /** Appends one Responses tool result. */
@@ -2818,7 +2894,11 @@ export function appendResponsesToolResultMessages<TApi extends Api>(
 	supportsCustomToolCalls = true,
 	computerCallIds?: ReadonlySet<string>,
 ): void {
-	const { output, outputText } = encodeResponsesToolResultOutput(toolResult, model, supportsImageDetailOriginal);
+	const { output, outputText, trailingImageContent } = encodeResponsesToolResultOutput(
+		toolResult,
+		model,
+		supportsImageDetailOriginal,
+	);
 	const normalized = normalizeResponsesToolCallId(toolResult.toolCallId);
 	if (toolResult.providerMetadata?.type === "computer" && model.supportsComputerUse !== true) {
 		messages.push({
@@ -2869,17 +2949,25 @@ export function appendResponsesToolResultMessages<TApi extends Api>(
 		return;
 	}
 	if (supportsCustomToolCalls && customCallIds?.has(normalized.callId)) {
-		messages.push({
-			type: "custom_tool_call_output",
-			call_id: normalized.callId,
-			output,
-		} as ResponseInput[number]);
+		appendEncodedResponsesToolOutput(
+			messages,
+			{
+				type: "custom_tool_call_output",
+				call_id: normalized.callId,
+				output,
+			} as ResponseInput[number],
+			trailingImageContent,
+		);
 	} else {
-		messages.push({
-			type: "function_call_output",
-			call_id: normalized.callId,
-			output,
-		});
+		appendEncodedResponsesToolOutput(
+			messages,
+			{
+				type: "function_call_output",
+				call_id: normalized.callId,
+				output,
+			},
+			trailingImageContent,
+		);
 	}
 }
 

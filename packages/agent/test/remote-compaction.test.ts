@@ -422,6 +422,44 @@ describe("buildOpenAiNativeHistory multimodal tool results", () => {
 		]);
 		expect(items.some(item => item.type === "message" && item.role === "user")).toBe(false);
 	});
+
+	test("keeps OpenRouter non-OpenAI tool images in a following user message", () => {
+		const imageData = Buffer.from("read image").toString("base64");
+		const result: ToolResultMessage = {
+			role: "toolResult",
+			toolCallId: "call_image|fc_call_image",
+			toolName: "read",
+			content: [
+				{ type: "text", text: "Read image file [image/png]" },
+				{ type: "image", data: imageData, mimeType: "image/png" },
+			],
+			isError: false,
+			timestamp: Date.now(),
+		};
+		const model = makeOpenAiModel({
+			id: "google/gemini-4-argon",
+			provider: "openrouter",
+			baseUrl: "https://openrouter.ai/api/v1",
+			input: ["text", "image"],
+		});
+
+		const items = buildOpenAiNativeHistory(
+			[codexAssistant([{ callId: "call_image" }], true), result],
+			model,
+			undefined,
+			false,
+		);
+
+		expect(items.find(item => item.type === "function_call_output")?.output).toBe("Read image file [image/png]");
+		expect(items.at(-1)).toEqual({
+			type: "message",
+			role: "user",
+			content: [
+				{ type: "input_text", text: "Attached image(s) from tool result:" },
+				{ type: "input_image", detail: "auto", image_url: `data:image/png;base64,${imageData}` },
+			],
+		});
+	});
 });
 
 describe("buildOpenAiNativeHistory interleaved assistant message (#8789)", () => {
