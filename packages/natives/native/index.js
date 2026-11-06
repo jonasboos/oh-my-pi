@@ -293,4 +293,8 @@ export const ShellFsResolve = {
 	Logical: "logical",
 	None: "none",
 };
+export const OutputIncompleteReason = {
+	ForwardStalled: "forward_stalled",
+	ConsumerGone: "consumer_gone",
+};
 // --- end generated native exports ---

@@ -165,6 +165,7 @@ const FIELD_RULES: Record<string, Rule> = {
 		"tokens",
 		"isDirectory",
 		"timedOut",
+		"outputIncomplete",
 		"pid",
 		"resultLimitReached",
 		"reached",

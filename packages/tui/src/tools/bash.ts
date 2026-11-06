@@ -81,6 +81,12 @@ export interface BashToolDetails {
 	exitCode?: number;
 	/** True when the command was killed by its timeout deadline (not a failure). */
 	timedOut?: boolean;
+	/**
+	 * True when the output bridge dropped the tail. The exit status is still
+	 * the child's; the captured text is not the full output. Background
+	 * delivery carries the same flag.
+	 */
+	outputIncomplete?: boolean;
 	/** Text the command wrote to `out://`, oldest first; transcripts draw each as a reply after the call. */
 	replies?: string[];
 	/**

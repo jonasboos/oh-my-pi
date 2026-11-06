@@ -150,6 +150,14 @@ export const stateDefs = {
 		"exitCode?": "number.integer",
 		cancelled: "boolean",
 		"timedOut?": "boolean",
+		"outputIncomplete?": doc(
+			"boolean",
+			"True when the output bridge dropped the tail. The exit code is still the child's; `output` is not the full stream.",
+		),
+		"forwardedBytes?": doc(
+			"number.integer",
+			"Bytes the bridge delivered before it stopped. Set together with `outputIncomplete`.",
+		),
 		truncated: "boolean",
 		totalLines: "number.integer",
 		totalBytes: "number.integer",

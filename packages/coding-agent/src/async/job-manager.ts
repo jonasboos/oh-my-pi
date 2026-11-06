@@ -77,6 +77,8 @@ export interface AsyncJobDetails extends Record<string, unknown> {
 	images?: ImageContent[];
 	/** Tool output metadata needed when a completion is delivered or recovered later. */
 	meta?: OutputMeta;
+	/** True when a bash job's output bridge dropped the tail. The exit status is still the child's. */
+	outputIncomplete?: boolean;
 }
 
 export interface AsyncJob {

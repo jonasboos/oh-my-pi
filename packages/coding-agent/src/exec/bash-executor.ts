@@ -147,6 +147,13 @@ export interface BashResult extends OutputSummary {
 	/** The native minimizer's rewrite, set when its output replaced the raw stream. */
 	minimized?: MinimizedMeta;
 	workingDir?: string;
+	/**
+	 * True when the output bridge stopped before end-of-output and the run was
+	 * neither cancelled nor timed out. The exit code is still the child's.
+	 */
+	outputIncomplete?: boolean;
+	/** Bytes the bridge delivered before it stopped. Set with `outputIncomplete`. */
+	forwardedBytes?: number;
 	/** Terminal graphics extracted from raw stdout before sanitization or truncation. */
 	images?: ImageContent[];
 }
@@ -158,6 +165,22 @@ const SAFE_ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 /** A `scheme://` working directory: it exists only in the embedded shell's injected filesystem. */
 const URL_CWD_RE = /^[a-z][a-z0-9+.-]*:\/\//i;
+
+/**
+ * Model-facing line appended when the output bridge dropped the tail. The exit
+ * status in the line is the child's; callers must not treat the captured text
+ * as the full output.
+ */
+export function formatShellOutputIncompleteNotice(bytes: number, exitCode: number | undefined): string {
+	const status = exitCode === undefined ? "unavailable" : String(exitCode);
+	const delivered = Number.isFinite(bytes) && bytes > 0 ? Math.trunc(bytes) : 0;
+	return `[output incomplete: shell output bridge disconnected after ${delivered} bytes; exit status ${status} is still authoritative]`;
+}
+
+function appendShellOutputNotice(output: string, notice: string): string {
+	if (output.length === 0) return notice;
+	return output.endsWith("\n") ? `${output}${notice}` : `${output}\n${notice}`;
+}
 
 /** Cadence of the `onTrace` poll while an embedded run is in flight. */
 const TRACE_POLL_MS = 80;
@@ -933,14 +956,23 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 			}
 		}
 
-		// Normal completion
+		// Normal completion. A bridge that stopped early still reports the child's
+		// exit code, and says so: the captured text is not the full output.
+		const summary = await dump();
+		const outputIncomplete = winner.result.outputIncomplete != null;
+		const forwardedBytes = winner.result.forwardedBytes ?? 0;
+		const incompleteNotice = outputIncomplete
+			? formatShellOutputIncompleteNotice(forwardedBytes, winner.result.exitCode)
+			: undefined;
 		return {
 			exitCode: winner.result.exitCode,
 			cancelled: false,
 			workingDir: winner.result.workingDir,
+			...(outputIncomplete ? { outputIncomplete: true, forwardedBytes } : {}),
 			...(minimizedMeta ? { minimized: minimizedMeta } : {}),
 			...settleTrace(),
-			...(await dump()),
+			...summary,
+			...(incompleteNotice ? { output: appendShellOutputNotice(summary.output, incompleteNotice) } : {}),
 		};
 	} catch (err) {
 		resetSession = true;

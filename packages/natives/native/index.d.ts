@@ -3851,6 +3851,20 @@ export interface ShellRunOptions {
   trace?: RunTrace
 }
 
+/**
+ * Why the output bridge stopped before the child's stream ended.
+ *
+ * Absent when every accepted chunk was delivered, or the run was cancelled
+ * or timed out. Those outcomes already say the capture may be partial. Set
+ * on a run that otherwise completed: the exit code is still the child's.
+ */
+export declare enum OutputIncompleteReason {
+  /** One chunk forward did not return within the stall deadline. */
+  ForwardStalled = 'forward_stalled',
+  /** The JS callback failed, or the consumer went away. */
+  ConsumerGone = 'consumer_gone'
+}
+
 /** Result of running a shell command. */
 export interface ShellRunResult {
   /** Exit code when the command completes normally. */
@@ -3859,6 +3873,16 @@ export interface ShellRunResult {
   cancelled: boolean
   /** Whether the command timed out before completion. */
   timedOut: boolean
+  /**
+   * Set when the output bridge stopped before end-of-output for a reason
+   * other than cancel or timeout. The exit code is still the child's.
+   */
+  outputIncomplete?: OutputIncompleteReason
+  /**
+   * Bytes handed to the consumer before `outputIncomplete`. The chunk that
+   * stalled or was rejected is not included. `None` when delivery finished.
+   */
+  forwardedBytes?: number
   /**
    * When the minimizer rewrote the captured output, this carries the
    * original buffer + telemetry so the session layer can persist it as

@@ -57,6 +57,8 @@ type AsyncResultJobDetails = {
 	durationMs?: number;
 	/** Source capture metadata belongs to this job, not to the enclosing delivery report. */
 	meta?: OutputMeta;
+	/** True when the job's output bridge dropped the tail. The delivered text is not the full output. */
+	outputIncomplete?: boolean;
 	/** Full structured payload (source/mode/status/data/error), when the job used an output schema. */
 	schema?: StructuredSubagentOutput;
 };
@@ -157,6 +159,7 @@ export function buildAsyncResultBatchMessage(entries: AsyncResultEntry[]): Custo
 			namedByCommand: command !== undefined,
 			durationMs: entry.durationMs,
 			meta: entry.job?.latestDetails?.meta,
+			outputIncomplete: entry.job?.latestDetails?.outputIncomplete === true,
 			structured,
 			structuredJson: structuredJson === undefined ? undefined : escapeHarnessTags(structuredJson),
 			hasStructuredData,
@@ -176,6 +179,7 @@ export function buildAsyncResultBatchMessage(entries: AsyncResultEntry[]): Custo
 			label: job.label,
 			durationMs: job.durationMs,
 			...(job.meta ? { meta: job.meta } : {}),
+			...(job.outputIncomplete ? { outputIncomplete: true } : {}),
 			...(job.structured ? { schema: job.structured } : {}),
 		})),
 	};

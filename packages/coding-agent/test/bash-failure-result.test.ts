@@ -5,8 +5,10 @@ import * as path from "node:path";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { Skill } from "@oh-my-pi/pi-coding-agent/extensibility/skills";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
+import { buildAsyncResultBatchMessage } from "@oh-my-pi/pi-coding-agent/session/async-job-delivery";
 import { BashTool } from "@oh-my-pi/pi-coding-agent/tools/bash";
-import { Shell } from "@oh-my-pi/pi-natives";
+import { OutputIncompleteReason, Shell } from "@oh-my-pi/pi-natives";
 import { getThemeByName } from "@oh-my-pi/pi-tui/theme";
 import { bashToolRenderer } from "@oh-my-pi/pi-tui/tools/bash";
 
@@ -138,6 +140,97 @@ describe("BashTool execution results", () => {
 		const message = (error as Error).message;
 		expect(message.match(/\[Command cancelled\]/gu)).toHaveLength(1);
 		expect(message).not.toContain("Command aborted");
+	});
+
+	it("surfaces an incomplete output bridge as a notice and a details flag", async () => {
+		spyOn(Shell.prototype, "run").mockImplementation((_options, onChunk) => {
+			onChunk?.(null, "first");
+			return Promise.resolve({
+				exitCode: 0,
+				cancelled: false,
+				timedOut: false,
+				outputIncomplete: OutputIncompleteReason.ForwardStalled,
+				forwardedBytes: 5,
+			});
+		});
+		const tool = new BashTool(makeSession());
+		const result = await tool.execute("call-incomplete", { command: "printf first; printf last" });
+		const text = result.content.find(block => block.type === "text")?.text ?? "";
+
+		// Exit 0 stays a successful command. The text must not read as the full output.
+		expect(result.isError).toBeUndefined();
+		expect(result.details?.exitCode).toBeUndefined();
+		expect(result.details?.outputIncomplete).toBe(true);
+		expect(text).toContain("first");
+		expect(text).toContain(
+			"[output incomplete: shell output bridge disconnected after 5 bytes; exit status 0 is still authoritative]",
+		);
+		expect(text.trim()).not.toBe("first");
+	});
+
+	it("does not deliver a background job's dropped tail as complete output", async () => {
+		const delivered: string[] = [];
+		const manager = new AsyncJobManager({
+			onJobComplete: (_jobId, text) => {
+				delivered.push(text);
+			},
+		});
+		try {
+			spyOn(Shell.prototype, "run").mockImplementation((_options, onChunk) => {
+				onChunk?.(null, "first");
+				return Promise.resolve({
+					exitCode: 0,
+					cancelled: false,
+					timedOut: false,
+					outputIncomplete: OutputIncompleteReason.ForwardStalled,
+					forwardedBytes: 5,
+				});
+			});
+			const session = makeSession();
+			const tool = new BashTool({
+				...session,
+				settings: Settings.isolated({
+					"async.enabled": true,
+					"bash.autoBackground.enabled": false,
+					"bash.autoBackground.thresholdMs": 60_000,
+					"bashInterceptor.enabled": false,
+					"astGrep.enabled": false,
+					"astEdit.enabled": false,
+					"grep.enabled": false,
+					"glob.enabled": false,
+				}),
+				asyncJobManager: manager,
+				getSessionId: () => "session-incomplete",
+			} as unknown as ToolSession);
+			const started = await tool.execute("call-bg-incomplete", {
+				command: "printf first; printf last",
+				async: true,
+			});
+			const jobId = started.details?.async?.jobId;
+			if (!jobId) throw new Error("expected background job");
+			await manager.waitForAll();
+			for (let attempt = 0; attempt < 20 && delivered.length === 0; attempt++) await Bun.sleep(10);
+			const job = manager.getJob(jobId);
+
+			// The command finished (exit 0), so the job completes. A regression that
+			// only kept `status: completed` and the captured prefix would hide the
+			// dropped tail. The delivery has to carry the same incomplete flag.
+			expect(job?.status).toBe("completed");
+			expect(job?.latestDetails?.outputIncomplete).toBe(true);
+			expect(job?.resultText).toContain("first");
+			expect(job?.resultText).toContain(
+				"[output incomplete: shell output bridge disconnected after 5 bytes; exit status 0 is still authoritative]",
+			);
+			expect(delivered.some(text => text.includes("[output incomplete:"))).toBe(true);
+			const message = buildAsyncResultBatchMessage([
+				{ jobId, result: job?.resultText ?? "", job, durationMs: 1, epoch: 0 },
+			]);
+			expect(message?.details?.jobs[0]).toMatchObject({ status: "completed", outputIncomplete: true });
+			const content = typeof message?.content === "string" ? message.content : "";
+			expect(content).toContain("[output incomplete:");
+		} finally {
+			await manager.dispose();
+		}
 	});
 
 	it("returns a success result with no exit-code detail for a zero exit", async () => {

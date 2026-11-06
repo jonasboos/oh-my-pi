@@ -2582,15 +2582,19 @@ func (v *SessionState) decodeFrom(raw map[string]json.RawMessage) error {
 }
 
 type BashResult struct {
-	Output              string  `json:"output"`
-	Cancelled           bool    `json:"cancelled"`
-	Truncated           bool    `json:"truncated"`
-	TotalLines          int64   `json:"totalLines"`
-	TotalBytes          int64   `json:"totalBytes"`
-	OutputLines         int64   `json:"outputLines"`
-	OutputBytes         int64   `json:"outputBytes"`
-	ExitCode            *int64  `json:"exitCode,omitempty"`
-	TimedOut            *bool   `json:"timedOut,omitempty"`
+	Output      string `json:"output"`
+	Cancelled   bool   `json:"cancelled"`
+	Truncated   bool   `json:"truncated"`
+	TotalLines  int64  `json:"totalLines"`
+	TotalBytes  int64  `json:"totalBytes"`
+	OutputLines int64  `json:"outputLines"`
+	OutputBytes int64  `json:"outputBytes"`
+	ExitCode    *int64 `json:"exitCode,omitempty"`
+	TimedOut    *bool  `json:"timedOut,omitempty"`
+	// True when the output bridge dropped the tail. The exit code is still the child's; `output` is not the full stream.
+	OutputIncomplete *bool `json:"outputIncomplete,omitempty"`
+	// Bytes the bridge delivered before it stopped. Set together with `outputIncomplete`.
+	ForwardedBytes      *int64  `json:"forwardedBytes,omitempty"`
 	ArtifactID          *string `json:"artifactId,omitempty"`
 	ArtifactElidedBytes *int64  `json:"artifactElidedBytes,omitempty"`
 	// Bytes dropped from the middle of `output`, which keeps the head and tail.
@@ -2629,6 +2633,8 @@ func (v *BashResult) decodeFrom(raw map[string]json.RawMessage) error {
 	d.required("outputBytes", &out.OutputBytes)
 	d.optional("exitCode", &out.ExitCode)
 	d.optional("timedOut", &out.TimedOut)
+	d.optional("outputIncomplete", &out.OutputIncomplete)
+	d.optional("forwardedBytes", &out.ForwardedBytes)
 	d.optional("artifactId", &out.ArtifactID)
 	d.optional("artifactElidedBytes", &out.ArtifactElidedBytes)
 	d.optional("elidedBytes", &out.ElidedBytes)

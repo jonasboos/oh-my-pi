@@ -530,6 +530,10 @@ export interface BashResult {
 	outputBytes: number;
 	exitCode?: number;
 	timedOut?: boolean;
+	/** True when the output bridge dropped the tail. The exit code is still the child's; `output` is not the full stream. */
+	outputIncomplete?: boolean;
+	/** Bytes the bridge delivered before it stopped. Set together with `outputIncomplete`. */
+	forwardedBytes?: number;
 	artifactId?: string;
 	artifactElidedBytes?: number;
 	/** Bytes dropped from the middle of `output`, which keeps the head and tail. */

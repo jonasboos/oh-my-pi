@@ -798,6 +798,32 @@ exit 64
 		expect(result.output.trim()).toBe("done");
 	});
 
+	it("says when a successful run's output bridge dropped the tail", async () => {
+		vi.spyOn(piNatives.Shell.prototype, "run").mockImplementation((_options, onChunk) => {
+			onChunk?.(null, "first");
+			return Promise.resolve({
+				exitCode: 0,
+				cancelled: false,
+				timedOut: false,
+				outputIncomplete: piNatives.OutputIncompleteReason.ForwardStalled,
+				forwardedBytes: 5,
+			});
+		});
+
+		const result = await executeBash("printf first; printf last", { cwd: tempDir, timeout: 5000 });
+
+		// The child exited 0, but the captured text is not the command's full output.
+		expect(result.exitCode).toBe(0);
+		expect(result.cancelled).toBe(false);
+		expect(result.outputIncomplete).toBe(true);
+		expect(result.forwardedBytes).toBe(5);
+		expect(result.output).toContain("first");
+		expect(result.output).toContain(
+			"[output incomplete: shell output bridge disconnected after 5 bytes; exit status 0 is still authoritative]",
+		);
+		expect(result.output.trim()).not.toBe("first");
+	});
+
 	it("returns promptly and quarantines the session key when native abort cleanup stalls", async () => {
 		if (process.platform === "win32") {
 			return;

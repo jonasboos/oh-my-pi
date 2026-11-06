@@ -2784,6 +2784,14 @@
 				"timedOut": {
 					"type": "boolean"
 				},
+				"outputIncomplete": {
+					"type": "boolean",
+					"description": "True when the output bridge dropped the tail. The exit code is still the child's; `output` is not the full stream."
+				},
+				"forwardedBytes": {
+					"type": "integer",
+					"description": "Bytes the bridge delivered before it stopped. Set together with `outputIncomplete`."
+				},
 				"artifactId": {
 					"type": "string"
 				},

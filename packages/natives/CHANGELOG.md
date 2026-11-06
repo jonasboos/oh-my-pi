@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed shell runs reporting only the child's exit code when the output bridge stalls or the consumer disconnects; the result now says the capture is incomplete ([#18250](https://github.com/can1357/oh-my-pi/issues/18250)).
+
 ## [18.17.0] - 2026-11-06
 
 ### Breaking Changes

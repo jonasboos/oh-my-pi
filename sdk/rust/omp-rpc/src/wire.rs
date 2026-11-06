@@ -3129,6 +3129,12 @@ pub struct BashResult {
 	pub exit_code: Option<i64>,
 	#[serde(rename = "timedOut", default, skip_serializing_if = "Option::is_none")]
 	pub timed_out: Option<bool>,
+	/// True when the output bridge dropped the tail. The exit code is still the child's; `output` is not the full stream.
+	#[serde(rename = "outputIncomplete", default, skip_serializing_if = "Option::is_none")]
+	pub output_incomplete: Option<bool>,
+	/// Bytes the bridge delivered before it stopped. Set together with `outputIncomplete`.
+	#[serde(rename = "forwardedBytes", default, skip_serializing_if = "Option::is_none")]
+	pub forwarded_bytes: Option<i64>,
 	#[serde(rename = "artifactId", default, skip_serializing_if = "Option::is_none")]
 	pub artifact_id: Option<String>,
 	#[serde(rename = "artifactElidedBytes", default, skip_serializing_if = "Option::is_none")]

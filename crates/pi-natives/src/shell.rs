@@ -444,15 +444,38 @@ impl From<CoreMinimizerResult> for MinimizerResult {
 	}
 }
 
+/// Why the output bridge stopped before the child's stream ended.
+///
+/// Absent when every accepted chunk was delivered, or the run was cancelled
+/// or timed out. Those outcomes already say the capture may be partial. Set
+/// on a run that otherwise completed: the exit code is still the child's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[napi(string_enum)]
+pub enum OutputIncompleteReason {
+	/// One chunk forward did not return within the stall deadline.
+	#[napi(value = "forward_stalled")]
+	ForwardStalled,
+	/// The JS callback failed, or the consumer went away.
+	#[napi(value = "consumer_gone")]
+	ConsumerGone,
+}
+
 /// Result of running a shell command.
 #[napi(object)]
 pub struct ShellRunResult {
 	/// Exit code when the command completes normally.
-	pub exit_code: Option<i32>,
+	pub exit_code:         Option<i32>,
 	/// Whether the command was cancelled via abort.
-	pub cancelled: bool,
+	pub cancelled:         bool,
 	/// Whether the command timed out before completion.
-	pub timed_out: bool,
+	pub timed_out:         bool,
+	/// Set when the output bridge stopped before end-of-output for a reason
+	/// other than cancel or timeout. The exit code is still the child's.
+	pub output_incomplete: Option<OutputIncompleteReason>,
+	/// Bytes handed to the consumer before `output_incomplete`. The chunk
+	/// that stalled or was rejected is not included. `None` when delivery
+	/// finished.
+	pub forwarded_bytes:   Option<u32>,
 
 	/// When the minimizer rewrote the captured output, this carries the
 	/// original buffer + telemetry so the session layer can persist it as
@@ -466,11 +489,13 @@ pub struct ShellRunResult {
 impl From<CoreShellRunResult> for ShellRunResult {
 	fn from(value: CoreShellRunResult) -> Self {
 		Self {
-			exit_code:   value.exit_code,
-			cancelled:   value.cancelled,
-			timed_out:   value.timed_out,
-			minimized:   value.minimized.map(Into::into),
-			working_dir: value.working_dir,
+			exit_code:         value.exit_code,
+			cancelled:         value.cancelled,
+			timed_out:         value.timed_out,
+			output_incomplete: None,
+			forwarded_bytes:   None,
+			minimized:         value.minimized.map(Into::into),
+			working_dir:       value.working_dir,
 		}
 	}
 }
@@ -495,7 +520,9 @@ impl Shell {
 	///
 	/// The `on_chunk` callback receives streamed stdout/stderr output. Returns
 	/// the exit code when the command completes, or flags when cancelled or
-	/// timed out.
+	/// timed out. `output_incomplete` is set when the output bridge stopped
+	/// before end-of-output for another reason; the exit code is still the
+	/// child's.
 	#[napi]
 	pub fn run<'env>(
 		&self,
@@ -517,12 +544,12 @@ impl Shell {
 		};
 		task::future(env, "shell.run", async move {
 			let (chunk_tx, drain_handle) = bridge_chunks(on_chunk);
-			let result = inner
+			let mut result = inner
 				.run(run_options, chunk_tx, cancel_token.into_core())
 				.await
 				.map(Into::into)
 				.map_err(|err| Error::from_reason(err.to_string()));
-			await_drain(drain_handle, &result).await;
+			await_drain(drain_handle, &mut result).await;
 			result
 		})
 	}
@@ -579,7 +606,9 @@ pub fn run_shell_main(argv: Vec<String>) -> i32 {
 ///
 /// Creates a fresh session for each call. The `on_chunk` callback receives
 /// streamed stdout/stderr output. Returns the exit code when the command
-/// completes, or flags when cancelled or timed out.
+/// completes, or flags when cancelled or timed out. `output_incomplete` is
+/// set when the output bridge stopped before end-of-output for another
+/// reason; the exit code is still the child's.
 #[napi]
 pub fn execute_shell<'env>(
 	env: &'env Env,
@@ -600,11 +629,11 @@ pub fn execute_shell<'env>(
 	};
 	task::future(env, "shell.execute", async move {
 		let (chunk_tx, drain_handle) = bridge_chunks(on_chunk);
-		let result = core_execute_shell(exec_options, chunk_tx, cancel_token.into_core())
+		let mut result = core_execute_shell(exec_options, chunk_tx, cancel_token.into_core())
 			.await
 			.map(Into::into)
 			.map_err(|err| Error::from_reason(err.to_string()));
-		await_drain(drain_handle, &result).await;
+		await_drain(drain_handle, &mut result).await;
 		result
 	})
 }
@@ -632,7 +661,7 @@ pub(crate) const FORWARD_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn bridge_chunks(
 	on_chunk: Option<ThreadsafeFunction<String, UnknownReturnValue>>,
-) -> (Option<flume::Sender<String>>, Option<napi::tokio::task::JoinHandle<()>>) {
+) -> (Option<flume::Sender<String>>, Option<napi::tokio::task::JoinHandle<ChunkPumpStop>>) {
 	let Some(on_chunk) = on_chunk else {
 		return (None, None);
 	};
@@ -666,6 +695,24 @@ impl BridgeItem for String {
 	}
 }
 
+/// Why [`pump_chunks`] returned before the bridge had delivered every chunk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChunkPumpStop {
+	/// The channel disconnected or an end-of-output marker arrived, and every
+	/// batch taken off the queue was forwarded.
+	Complete,
+	/// `forward` returned `false`: the callback failed or the consumer is gone.
+	ConsumerGone {
+		/// Bytes of batches whose `forward` returned `true`.
+		forwarded_bytes: u64,
+	},
+	/// One `forward` did not finish within the stall deadline.
+	ForwardStalled {
+		/// Bytes of batches whose `forward` returned `true`.
+		forwarded_bytes: u64,
+	},
+}
+
 /// Drain `rx`, greedily coalescing queued chunks into ≤64 KiB batches, and
 /// feed each batch to `forward`, awaiting its completion before pulling more.
 /// Returns when `rx` disconnects (all senders dropped), on an end-of-output
@@ -674,6 +721,8 @@ impl BridgeItem for String {
 /// dropping `rx` disconnects the channel so parked/future senders fail fast and
 /// the readers keep draining the child instead of wedging it (#12657).
 ///
+/// `Complete` is the only stop that delivered every chunk. The other stops
+/// name why the tail was dropped and how many bytes had already been accepted.
 /// `busy` is held from the moment a chunk is taken until its batch has been
 /// forwarded, so an empty queue with `busy` clear really means no output is
 /// in transit (the PTY's stuck-open-slave check).
@@ -682,7 +731,7 @@ pub(crate) async fn pump_chunks<T: BridgeItem + Send>(
 	stall_timeout: Duration,
 	busy: Option<&AtomicBool>,
 	mut forward: impl AsyncFnMut(String) -> bool,
-) {
+) -> ChunkPumpStop {
 	// Hard cap on one coalesced batch so the JS main thread never sees a
 	// multi-MB napi callback (a giant single string would stall sanitize +
 	// tail-buffer maintenance for the whole copy).
@@ -697,6 +746,7 @@ pub(crate) async fn pump_chunks<T: BridgeItem + Send>(
 	};
 	let mut batch = String::with_capacity(INITIAL_BATCH_CAP);
 	let mut ended = false;
+	let mut forwarded_bytes: u64 = 0;
 	while !ended
 		&& let Ok(first) = rx.recv_async().await
 		&& let Some(first) = first.into_text()
@@ -719,19 +769,25 @@ pub(crate) async fn pump_chunks<T: BridgeItem + Send>(
 			}
 		}
 		let payload = std::mem::replace(&mut batch, String::with_capacity(INITIAL_BATCH_CAP));
+		let payload_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
 		// A single napi `call_async` that never returns (a wedged JS consumer)
 		// must not park the pump forever: that keeps the bridge queue full, the
 		// reader parked on its send, and the child blocked in `write(2)` so it
 		// never exits and the run never settles (#12657). Bound each forward;
 		// on a stall, return so `rx` drops and the bridge disconnects,
 		// unblocking the reader and child. The deadline resets per forward, so a
-		// slow-but-progressing consumer still drains losslessly.
+		// slow-but-progressing consumer still drains losslessly. Bytes count
+		// only after `forward` returns `true`: a stalled or rejected batch never
+		// reached the consumer.
 		let forwarded = napi::tokio::time::timeout(stall_timeout, forward(payload)).await;
 		set_busy(false);
-		if !matches!(forwarded, Ok(true)) {
-			return;
+		match forwarded {
+			Ok(true) => forwarded_bytes = forwarded_bytes.saturating_add(payload_bytes),
+			Ok(false) => return ChunkPumpStop::ConsumerGone { forwarded_bytes },
+			Err(_elapsed) => return ChunkPumpStop::ForwardStalled { forwarded_bytes },
 		}
 	}
+	ChunkPumpStop::Complete
 }
 
 /// Upper bound on how long to wait for the chunk-forwarding pump after an
@@ -745,18 +801,26 @@ const INTERRUPTED_DRAIN_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 /// Finish forwarding accepted output after a native shell run resolves.
 ///
 /// Normal completion and errors drain without a deadline to preserve every
-/// accepted chunk. Cancellation and timeout are bounded because an orphaned
+/// accepted chunk. When that drain stops before end-of-output, the result
+/// records why. Cancellation and timeout are bounded because an orphaned
 /// pipe reader can otherwise keep a sender alive forever; aborting the pump
-/// drops its `flume::Receiver`, disconnecting that reader.
+/// drops its `flume::Receiver`, disconnecting that reader. Those runs already
+/// say the capture may be partial, so a pump stop is not also marked
+/// incomplete.
 async fn await_drain(
-	handle: Option<napi::tokio::task::JoinHandle<()>>,
-	result: &Result<ShellRunResult>,
+	handle: Option<napi::tokio::task::JoinHandle<ChunkPumpStop>>,
+	result: &mut Result<ShellRunResult>,
 ) {
 	let Some(mut handle) = handle else {
 		return;
 	};
 	if !matches!(result, Ok(result) if result.cancelled || result.timed_out) {
-		let _ = handle.await;
+		// A panicked pump did not finish the stream. Mark the capture
+		// incomplete rather than resolving a successful run with a silent tail.
+		let stop = handle
+			.await
+			.unwrap_or(ChunkPumpStop::ConsumerGone { forwarded_bytes: 0 });
+		note_incomplete_output(result, stop);
 		return;
 	}
 	if napi::tokio::time::timeout(INTERRUPTED_DRAIN_SHUTDOWN_TIMEOUT, &mut handle)
@@ -766,6 +830,28 @@ async fn await_drain(
 		handle.abort();
 		let _ = handle.await;
 	}
+}
+
+/// Record a pump that stopped before end-of-output on a run that was neither
+/// cancelled nor timed out. The exit code is left as the child reported it.
+fn note_incomplete_output(result: &mut Result<ShellRunResult>, stop: ChunkPumpStop) {
+	let Ok(run) = result else {
+		return;
+	};
+	if run.cancelled || run.timed_out {
+		return;
+	}
+	let (reason, bytes) = match stop {
+		ChunkPumpStop::Complete => return,
+		ChunkPumpStop::ConsumerGone { forwarded_bytes } => {
+			(OutputIncompleteReason::ConsumerGone, forwarded_bytes)
+		},
+		ChunkPumpStop::ForwardStalled { forwarded_bytes } => {
+			(OutputIncompleteReason::ForwardStalled, forwarded_bytes)
+		},
+	};
+	run.output_incomplete = Some(reason);
+	run.forwarded_bytes = Some(u32::try_from(bytes).unwrap_or(u32::MAX));
 }
 
 #[cfg(test)]
@@ -786,8 +872,9 @@ mod tests {
 	use tokio::time;
 
 	use super::{
-		BRIDGE_QUEUE_CHUNKS, CoreShell, FORWARD_STALL_TIMEOUT, INTERRUPTED_DRAIN_SHUTDOWN_TIMEOUT,
-		ShellRunResult, await_drain, pump_chunks,
+		BRIDGE_QUEUE_CHUNKS, ChunkPumpStop, CoreShell, FORWARD_STALL_TIMEOUT,
+		INTERRUPTED_DRAIN_SHUTDOWN_TIMEOUT, OutputIncompleteReason, ShellRunResult, await_drain,
+		pump_chunks,
 	};
 
 	/// Regression for #4078: the reader→JS bridge queue must stay bounded when
@@ -861,10 +948,11 @@ mod tests {
 			.expect("sends must not park once the consumer died")
 			.expect("producer task");
 		assert!(disconnected > 0, "channel should disconnect after the pump stops");
-		time::timeout(Duration::from_secs(5), pump)
+		let stop = time::timeout(Duration::from_secs(5), pump)
 			.await
 			.expect("pump should exit after forward fails")
 			.expect("pump task");
+		assert_eq!(stop, ChunkPumpStop::ConsumerGone { forwarded_bytes: 0 });
 	}
 
 	/// A successful run must wait for every accepted bridge chunk even when a
@@ -888,23 +976,29 @@ mod tests {
 		tx.send("accepted".to_string())
 			.expect("pump should be connected");
 		drop(tx);
-		let result = Ok(ShellRunResult {
-			exit_code:   Some(0),
-			cancelled:   false,
-			timed_out:   false,
-			minimized:   None,
-			working_dir: None,
+		let mut result = Ok(ShellRunResult {
+			exit_code:         Some(0),
+			cancelled:         false,
+			timed_out:         false,
+			output_incomplete: None,
+			forwarded_bytes:   None,
+			minimized:         None,
+			working_dir:       None,
 		});
 
 		time::timeout(
 			INTERRUPTED_DRAIN_SHUTDOWN_TIMEOUT + Duration::from_secs(2),
-			await_drain(Some(handle), &result),
+			await_drain(Some(handle), &mut result),
 		)
 		.await
 		.expect("successful completion must drain slow accepted output");
 		assert!(
 			forwarded.load(Ordering::Acquire),
 			"accepted output was dropped before success returned"
+		);
+		assert!(
+			result.expect("run result").output_incomplete.is_none(),
+			"a slow consumer that still accepts every chunk is not an incomplete capture"
 		);
 	}
 
@@ -924,20 +1018,27 @@ mod tests {
 			async |_payload: String| true,
 		));
 		drop(tx);
-		let result = Ok(ShellRunResult {
-			exit_code:   None,
-			cancelled:   false,
-			timed_out:   true,
-			minimized:   None,
-			working_dir: None,
+		let mut result = Ok(ShellRunResult {
+			exit_code:         None,
+			cancelled:         false,
+			timed_out:         true,
+			output_incomplete: None,
+			forwarded_bytes:   None,
+			minimized:         None,
+			working_dir:       None,
 		});
 		let started = time::Instant::now();
 		time::timeout(
 			INTERRUPTED_DRAIN_SHUTDOWN_TIMEOUT + Duration::from_secs(2),
-			await_drain(Some(handle), &result),
+			await_drain(Some(handle), &mut result),
 		)
 		.await
 		.expect("await_drain must return when an interrupted reader orphans a sender");
+		assert!(
+			result.expect("run result").output_incomplete.is_none(),
+			"a timed-out run already reports a partial capture; the pump abort must not add a second \
+			 marker"
+		);
 		assert!(
 			started.elapsed() >= INTERRUPTED_DRAIN_SHUTDOWN_TIMEOUT,
 			"await_drain returned before its bound; the drain was not actually blocked",
@@ -966,10 +1067,11 @@ mod tests {
 		let pump = napi::tokio::spawn(pump_chunks(rx, STALL, None, async |_payload: String| {
 			std::future::pending::<bool>().await
 		}));
-		time::timeout(STALL + Duration::from_secs(5), pump)
+		let stop = time::timeout(STALL + Duration::from_secs(5), pump)
 			.await
 			.expect("pump must return after the per-forward stall deadline")
 			.expect("pump task");
+		assert_eq!(stop, ChunkPumpStop::ForwardStalled { forwarded_bytes: 0 });
 		assert!(
 			started.elapsed() >= STALL,
 			"pump returned before its stall deadline; the forward was not actually blocked",
@@ -980,6 +1082,81 @@ mod tests {
 			tx.send_async("late".to_string()).await.is_err(),
 			"the wedged pump must disconnect the bridge so the pipe reader unblocks",
 		);
+	}
+
+	/// Run `command` while `forward` consumes its bridge, then apply the pump
+	/// stop the way `Shell::run` does. A macro so each call site's closure is a
+	/// concrete `Send` future (`spawn` cannot see that through `AsyncFnMut`).
+	macro_rules! finish_run {
+		($command:expr, $stall:expr, $forward:expr) => {{
+			let shell = CoreShell::new(None);
+			let (tx, rx) = flume::bounded::<String>(BRIDGE_QUEUE_CHUNKS);
+			let pump = napi::tokio::spawn(pump_chunks(rx, $stall, None, $forward));
+			let run = tokio::spawn(async move {
+				shell
+					.run(
+						CoreShellRunOptions {
+							command:    $command.to_string(),
+							cwd:        None,
+							env:        None,
+							timeout_ms: None,
+							filesystem: None,
+							pipe_taps:  None,
+							trace:      None,
+						},
+						Some(tx),
+						CancelToken::default(),
+					)
+					.await
+			});
+			let core = time::timeout(Duration::from_secs(5), run)
+				.await
+				.expect("shell run should settle after the bridge stops")
+				.expect("shell task")
+				.expect("shell run");
+			let mut result = Ok(ShellRunResult::from(core));
+			time::timeout(Duration::from_secs(5), await_drain(Some(pump), &mut result))
+				.await
+				.expect("drain should finish once the pump stops");
+			result.expect("run result")
+		}};
+	}
+
+	/// Regression for #18250: a consumer that stalls past the forward deadline
+	/// during a command that exits 0 used to resolve with that exit code and no
+	/// sign that the tail was discarded. The exit status stays the child's, and
+	/// the result now says the capture stopped early.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn stalled_forward_during_successful_run_marks_output_incomplete() {
+		const STALL: Duration = Duration::from_millis(80);
+		let result = finish_run!(
+			"printf 'first\\n'; sleep 0.05; printf 'last\\n'",
+			STALL,
+			async |_payload: String| std::future::pending::<bool>().await
+		);
+		assert_eq!(result.exit_code, Some(0));
+		assert!(!result.cancelled);
+		assert!(!result.timed_out);
+		assert_eq!(result.output_incomplete, Some(OutputIncompleteReason::ForwardStalled));
+		// The stalled batch never returned, so nothing was confirmed delivered.
+		assert_eq!(result.forwarded_bytes, Some(0));
+	}
+
+	/// A callback that fails (env teardown, thrown JS callback) takes the same
+	/// early exit as a stall, but the result names that reason. The child's
+	/// exit code is unchanged.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn rejected_forward_during_successful_run_marks_consumer_gone() {
+		let result = finish_run!(
+			"printf 'first\\n'; sleep 0.05; printf 'last\\n'",
+			Duration::from_secs(5),
+			async |_payload: String| false
+		);
+		assert_eq!(result.exit_code, Some(0));
+		assert!(!result.cancelled);
+		assert!(!result.timed_out);
+		assert_eq!(result.output_incomplete, Some(OutputIncompleteReason::ConsumerGone));
+		assert_eq!(result.forwarded_bytes, Some(0));
 	}
 
 	mod child_session_action_tests {

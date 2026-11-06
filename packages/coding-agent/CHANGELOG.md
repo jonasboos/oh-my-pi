@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed bash runs that drop the tail of their output when the output bridge stalls or disconnects: the result now says the capture is incomplete, including on background delivery, while the command's exit status stays authoritative ([#18250](https://github.com/can1357/oh-my-pi/issues/18250)).
+
 ## [18.17.0] - 2026-11-06
 
 ### Added

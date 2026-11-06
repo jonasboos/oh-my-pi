@@ -21,7 +21,12 @@ import { isEnoent, logger, prompt } from "@oh-my-pi/pi-utils";
 import { isPosixShell } from "@oh-my-pi/pi-utils/procmgr";
 import { raceJobSettlement, resolveAutoBackgroundWaitMs } from "../async";
 import type { Settings } from "../config/settings";
-import { applyDirenvPreflight, type BashResult, executeBash } from "../exec/bash-executor";
+import {
+	applyDirenvPreflight,
+	type BashResult,
+	executeBash,
+	formatShellOutputIncompleteNotice,
+} from "../exec/bash-executor";
 import { InternalUrlRouter } from "../internal-urls";
 import { sessionResolveContext } from "../internal-urls/context";
 import { InternalUrlFilesystem, UrlFsError } from "../internal-urls/url-filesystem";
@@ -464,6 +469,13 @@ function normalizeResultOutput(result: BashResult | BashInteractiveResult): stri
 	return result.output || "";
 }
 
+/** Bridge drop on an embedded-shell result, with the bytes the bridge confirmed. */
+function shellOutputIncomplete(result: BashResult | BashInteractiveResult): { bytes: number } | undefined {
+	if (!("outputIncomplete" in result) || result.outputIncomplete !== true) return undefined;
+	const bytes = "forwardedBytes" in result && typeof result.forwardedBytes === "number" ? result.forwardedBytes : 0;
+	return { bytes };
+}
+
 /**
  * Incrementally decodes cumulative client-terminal snapshots. Normal snapshots
  * append only the unseen suffix; a host-side rolling/truncated window retires
@@ -780,6 +792,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				? undefined
 				: await this.#shapeOutput(result, options.toolCallId, options.command);
 		const outputLines = [shaped?.text ?? this.#formatResultOutput(result)];
+		const incomplete = shellOutputIncomplete(result);
 		const notices: string[] = [];
 		const wallTimeMs = options.wallTimeMs;
 		const wallTimeNoticeEmitted = wallTimeMs !== undefined && wallTimeMs >= WALL_TIME_NOTICE_MIN_MS;
@@ -794,6 +807,11 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		if (notices.length > 0) outputLines.push("", ...notices);
 		// Shaped output already leads with its exit status.
 		if (failedExit && !shaped?.text?.startsWith("[exit code ")) outputLines.push("", formatExitCodeNotice(exitCode));
+		// Shaping can replace the executor's body. Put the bridge notice back so
+		// the text the model reads is not a silent prefix of the command's output.
+		if (incomplete && !outputLines.some(line => line.includes("[output incomplete:"))) {
+			outputLines.push("", formatShellOutputIncompleteNotice(incomplete.bytes, exitCode));
+		}
 		const outputText = outputLines.join("\n");
 
 		// Timeouts are not failures — the command ran its course. Return an error
@@ -818,6 +836,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		if (failedExit) {
 			details.exitCode = exitCode;
 		}
+		if (incomplete) details.outputIncomplete = true;
 		if (options.replies?.length) details.replies = [...options.replies];
 		if (shaped?.spotlight) details.spotlight = shaped.spotlight;
 		// Native history is bounded; retain it whole so persisted calls remain replayable.
